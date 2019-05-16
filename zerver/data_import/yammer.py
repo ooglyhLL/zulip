@@ -14,6 +14,9 @@ from pathlib import PurePath
 import numpy as np
 import pandas as pd
 import dateutil.parser
+from dateutil.relativedelta import relativedelta
+import datetime
+from datetime import timezone
 
 from django.conf import settings
 from django.utils.timezone import now as timezone_now
@@ -787,13 +790,39 @@ def read_dumps(ymdumps, tables):
     append to the dictionary `tables`. The archives will be processed
     in order starting at index 0.
     """
+
+    def parse_time_str(t):
+        """
+        Convert date specification into `datetime` object
+
+        Returns `numpy.nan` if `t` is empty.
+        """
+        return dateutil.parser.parse(t) if t else np.nan
+
     for yd in ymdumps:
         logging.info("Reading %s\n" % yd)
         zf = zipfile.ZipFile(yd, 'r')
         zl = [ PurePath(x) for x in zf.namelist() ]
         for zp in zl:
             if zp.suffix == '.csv':
-                tbl = pd.read_csv(zf.open(str(zp)))
+                converters = {}
+                if zp.stem == 'Files':
+                    converters={ 'uploaded_at': parse_time_str,
+                                 'deleted_at': parse_time_str }
+                elif zp.stem == 'Groups':
+                    converters={ 'created_at': parse_time_str,
+                                 'updated_at': parse_time_str }
+                elif zp.stem == 'Messages':
+                    converters={ 'created_at': parse_time_str,
+                                 'deleted_at': parse_time_str }
+                elif zp.stem == 'Networks':
+                    converters={ 'created_at': parse_time_str }
+                elif zp.stem == 'Topics':
+                    converters={ 'created_at': parse_time_str }
+                elif zp.stem == 'Users':
+                    converters={ 'joined_at': parse_time_str,
+                                 'deleted_at': parse_time_str }
+                tbl = pd.read_csv(zf.open(str(zp)), converters=converters)
 #                if zp.stem == 'Files':
 #                    unpack_attachments(zf, tbl)
                 if not zp.stem in tables:
