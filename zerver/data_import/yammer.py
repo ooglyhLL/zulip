@@ -1,6 +1,5 @@
 import os
 import re
-import ujson
 import shutil
 import subprocess
 import logging
@@ -10,6 +9,7 @@ import zipfile
 
 from collections import defaultdict
 from pathlib import PurePath
+import mimetypes
 
 import numpy as np
 import pandas as pd
@@ -17,6 +17,7 @@ import dateutil.parser
 from dateutil.relativedelta import relativedelta
 import datetime
 from datetime import timezone
+from collections import namedtuple
 
 from django.conf import settings
 from django.utils.timezone import now as timezone_now
@@ -24,9 +25,7 @@ from django.forms.models import model_to_dict
 from typing import Any, Dict, List, Optional, Tuple, Set, Iterator
 from zerver.models import Reaction, RealmEmoji, UserProfile, Recipient, \
     CustomProfileField, CustomProfileFieldValue
-# FIXME: Convert or delete
-#from zerver.data_import.slack_message_conversion import convert_to_zulip_markdown, \
-#    get_user_full_name
+from zerver.data_import.yammer_message_conversion import convert_to_zulip_markdown
 from zerver.data_import.import_util import ZerverFieldsT, build_zerver_realm, \
     build_avatar, build_subscription, build_recipient, build_usermessages, \
     build_defaultstream, build_attachment, process_avatars, process_uploads, \
@@ -36,6 +35,7 @@ from zerver.data_import.sequencer import NEXT_ID
 from zerver.lib.upload import random_name, sanitize_name
 from zerver.lib.export import MESSAGE_BATCH_CHUNK_SIZE
 from zerver.lib.emoji import NAME_TO_CODEPOINT_PATH
+from zerver.lib.url_encoding import hash_util_encode, encode_stream
 
 # stubs
 AddedUsersT = Dict[str, int]
@@ -49,7 +49,6 @@ def rm_tree(path: str) -> None:
 def yammer_network_to_realm(domain_name: str, realm_id: int, realm_subdomain: str,
                             yammer_data: Dict[str, pd.DataFrame]) -> Tuple[ZerverFieldsT, AddedUsersT,
                                                                           AddedRecipientsT,
-                                                                          AddedGroupsT,
                                                                           List[ZerverFieldsT],
                                                                           ZerverFieldsT]:
     """
@@ -86,13 +85,11 @@ def yammer_network_to_realm(domain_name: str, realm_id: int, realm_subdomain: st
 
     realm['zerver_defaultstream'] = groups_to_zerver_stream_fields[0]
     realm['zerver_stream'] = groups_to_zerver_stream_fields[1]
-    realm['zerver_subscription'] = groups_to_zerver_stream_fields[3]
-    realm['zerver_recipient'] = groups_to_zerver_stream_fields[4]
-    added_groups = groups_to_zerver_stream_fields[2]
-    added_recipient = groups_to_zerver_stream_fields[5]
+    realm['zerver_subscription'] = groups_to_zerver_stream_fields[2]
+    realm['zerver_recipient'] = groups_to_zerver_stream_fields[3]
+    added_recipient = groups_to_zerver_stream_fields[4]
 
-    return realm, added_users, added_recipient, added_groups, avatars, emoji_url_map
-
+    return realm, added_users, added_recipient, avatars, emoji_url_map
 
 def users_to_zerver_userprofile(yammer_data: Dict[str, pd.DataFrame], realm_id: int,
                                 timestamp: Any, domain_name: str) -> Tuple[List[ZerverFieldsT],
@@ -116,151 +113,86 @@ def users_to_zerver_userprofile(yammer_data: Dict[str, pd.DataFrame], realm_id: 
     avatar_list = []  # type: List[ZerverFieldsT]
     added_users = {}
 
-    yammer_data['Users'] = yammer_data['Users'].assign(is_realm_admin=yammer_data['Users']['id'].isin(yammer_data['Admins']['id']))
+    users = yammer_data['Users']
+    users = users.assign(is_realm_admin=users.id.isin(yammer_data['Admins'].id))
+
+    msgs = yammer_data['Messages']
+    unknown_user_ids = msgs[~msgs.sender_id.isin(users.id)].sender_id.drop_duplicates()
+    unknown_user_count = 0
 
     # To map user id with the custom profile fields of the corresponding user
     slack_user_custom_field_map = {}  # type: ZerverFieldsT
     # To store custom fields corresponding to their ids
     custom_field_map = {}  # type: ZerverFieldsT
 
-    for user in yammer_data['Users'].itertuples():
+    def get_user_email(user: Tuple, domain: str):
+        if user and pd.notna(user.email):
+            return user.email
+        else:
+            # Make up unique email address which will hopefully be
+            # delivered to the postmaster if actually used.
+            import uuid
+            return str(uuid.uuid4()) + "@" + domain
+
+    for user in users.itertuples():
         userprofile = UserProfile(
             full_name=user.name,
             short_name="",
-            is_active=(pd.isna(user.deleted_by_id) and pd.isna(user.suspended_by_id)),
-            id=user.id,
-            email=user.email,
-            delivery_email=user.email,
+            is_active=((pd.notna(user.state) and user.state == "active")
+                       or pd.isna(user.deleted_by_id)
+                       and pd.isna(user.suspended_by_id)),
+            id=int(user.zulip_id),
+            email=get_user_email(user, domain_name),
+            delivery_email=get_user_email(user, domain_name),
             avatar_source='U',
             is_bot=False,
             pointer=-1,
             is_realm_admin=user.is_realm_admin,
             bot_type=None,
-            date_joined=dateutil.parser.parse(user.joined_at).timestamp(),
+            date_joined=user.joined_at,
             timezone="UTC",
             last_login=timestamp)
         userprofile_dict = model_to_dict(userprofile)
         # Set realm id separately as the corresponding realm is not yet a Realm model instance
         userprofile_dict['realm'] = realm_id
         zerver_userprofile.append(userprofile_dict)
-        added_users[user.id] = user.id
+        added_users[user.id] = user.zulip_id
 
-        logging.info(u"{} -> {}".format(user.name, user.email))
+        logging.info(u"{} -> {}".format(userprofile_dict['full_name'], userprofile_dict['email']))
 
-    process_customprofilefields(zerver_customprofilefield, zerver_customprofilefield_values)
+    for msg, user_id in unknown_user_ids.iteritems():
+        username = "Unknown User " + str(unknown_user_count)
+
+        userprofile = UserProfile(
+            full_name=username,
+            short_name="",
+            is_active=False,
+            id=int(user_id),
+            email=get_user_email(None, domain_name),
+            delivery_email=get_user_email(None, domain_name),
+            avatar_source='U',
+            is_bot=False,
+            pointer=-1,
+            is_realm_admin=False,
+            bot_type=None,
+            date_joined=yammer_data['Networks'].iloc[0].created_at,
+            timezone="UTC",
+            last_login=timestamp)
+        userprofile_dict = model_to_dict(userprofile)
+        # Set realm id separately as the corresponding realm is not yet a Realm model instance
+        userprofile_dict['realm'] = realm_id
+        zerver_userprofile.append(userprofile_dict)
+        added_users[user_id] = user_id
+        unknown_user_count += 1
+
+        logging.info(u"{}".format(userprofile_dict['full_name']))
+
     logging.info('######### IMPORTING USERS FINISHED #########\n')
     return zerver_userprofile, avatar_list, added_users, zerver_customprofilefield, \
         zerver_customprofilefield_values
 
-def build_customprofile_field(customprofile_field: List[ZerverFieldsT], fields: ZerverFieldsT,
-                              customprofilefield_id: int, realm_id: int,
-                              custom_field_map: ZerverFieldsT) -> Tuple[ZerverFieldsT, int]:
-    # The name of the custom profile field is not provided in the slack data
-    # Hash keys of the fields are provided
-    # Reference: https://api.slack.com/methods/users.profile.set
-    for field, value in fields.items():
-        if field not in custom_field_map:
-            slack_custom_fields = ['phone', 'skype']
-            if field in slack_custom_fields:
-                field_name = field
-            else:
-                field_name = ("slack custom field %s" % str(customprofilefield_id + 1))
-            customprofilefield = CustomProfileField(
-                id=customprofilefield_id,
-                name=field_name,
-                field_type=1  # For now this is defaulted to 'SHORT_TEXT'
-                              # Processing is done in the function 'process_customprofilefields'
-            )
-
-            customprofilefield_dict = model_to_dict(customprofilefield,
-                                                    exclude=['realm'])
-            customprofilefield_dict['realm'] = realm_id
-
-            custom_field_map[field] = customprofilefield_id
-            customprofilefield_id += 1
-            customprofile_field.append(customprofilefield_dict)
-    return custom_field_map, customprofilefield_id
-
-def process_slack_custom_fields(user: ZerverFieldsT,
-                                slack_user_custom_field_map: ZerverFieldsT) -> None:
-    slack_user_custom_field_map[user['id']] = {}
-    if user['profile'].get('fields'):
-        slack_user_custom_field_map[user['id']] = user['profile']['fields']
-
-    slack_custom_fields = ['phone', 'skype']
-    for field in slack_custom_fields:
-        if field in user['profile']:
-            slack_user_custom_field_map[user['id']][field] = {'value': user['profile'][field]}
-
-def build_customprofilefields_values(custom_field_map: ZerverFieldsT, fields: ZerverFieldsT,
-                                     user_id: int, custom_field_id: int,
-                                     custom_field_values: List[ZerverFieldsT]) -> int:
-    for field, value in fields.items():
-        if value['value'] == "":
-            # Skip writing entries for fields with an empty value
-            continue
-        custom_field_value = CustomProfileFieldValue(
-            id=custom_field_id,
-            value=value['value'])
-
-        custom_field_value_dict = model_to_dict(custom_field_value,
-                                                exclude=['user_profile', 'field'])
-        custom_field_value_dict['user_profile'] = user_id
-        custom_field_value_dict['field'] = custom_field_map[field]
-
-        custom_field_values.append(custom_field_value_dict)
-        custom_field_id += 1
-    return custom_field_id
-
-def process_customprofilefields(customprofilefield: List[ZerverFieldsT],
-                                customprofilefield_value: List[ZerverFieldsT]) -> None:
-    # Process the field types by checking all field values
-    for field in customprofilefield:
-        for field_value in customprofilefield_value:
-            if field_value['field'] == field['id'] and len(field_value['value']) > 50:
-                field['field_type'] = 2  # corresponding to Long text
-                break
-
-#def get_user_email(user: ZerverFieldsT, domain_name: str) -> str:
-#    if 'email' in user['profile']:
-#        return user['profile']['email']
-#    if 'bot_id' in user['profile']:
-#        if 'real_name_normalized' in user['profile']:
-#            slack_bot_name = user['profile']['real_name_normalized']
-#        elif 'first_name' in user['profile']:
-#            slack_bot_name = user['profile']['first_name']
-#        else:
-#            raise AssertionError("Could not identify bot type")
-#        return slack_bot_name.replace("Bot", "").replace(" ", "") + "-bot@%s" % (domain_name,)
-#    if get_user_full_name(user).lower() == "slackbot":
-#        return "imported-slackbot-bot@%s" % (domain_name,)
-#    raise AssertionError("Could not find email address for Slack user %s" % (user,))
-
-def build_avatar_url(slack_user_id: str, team_id: str, avatar_hash: str) -> str:
-    avatar_url = "https://ca.slack-edge.com/{}-{}-{}".format(team_id, slack_user_id,
-                                                             avatar_hash)
-    return avatar_url
-
-def get_admin(user: ZerverFieldsT) -> bool:
-    admin = user.get('is_admin', False)
-    owner = user.get('is_owner', False)
-    primary_owner = user.get('is_primary_owner', False)
-
-    if admin or owner or primary_owner:
-        return True
-    return False
-
-def get_user_timezone(user: ZerverFieldsT) -> str:
-    _default_timezone = "America/New_York"
-    timezone = user.get("tz", _default_timezone)
-    if timezone is None or '/' not in timezone:
-        timezone = _default_timezone
-    return timezone
-
 def groups_to_zerver_stream(yammer_data: Dict[str, pd.DataFrame], realm_id: int, added_users: AddedUsersT,
                             zerver_userprofile: List[ZerverFieldsT]) -> Tuple[List[ZerverFieldsT],
-                                                                              List[ZerverFieldsT],
-                                                                              AddedGroupsT,
                                                                               List[ZerverFieldsT],
                                                                               List[ZerverFieldsT],
                                                                               AddedRecipientsT]:
@@ -268,14 +200,12 @@ def groups_to_zerver_stream(yammer_data: Dict[str, pd.DataFrame], realm_id: int,
     Returns:
     1. zerver_defaultstream, which is a list of the default streams
     2. zerver_stream, while is a list of all streams
-    3. added_groups, which is a dictionary to map from channel name to channel id, zulip stream_id
-    4. zerver_subscription, which is a list of the subscriptions
-    5. zerver_recipient, which is a list of the recipients
-    6. added_recipient, which is a dictionary to map from channel name to zulip recipient_id
+    3. zerver_subscription, which is a list of the subscriptions                            
+    4. zerver_recipient, which is a list of the recipients                                  
+    5. added_recipient, which is a dictionary to map from channel name to zulip recipient_id
     """
     logging.info('######### IMPORTING GROUPS STARTED #########\n')
 
-    added_groups = {}
     added_recipient = {}
 
     zerver_stream = []
@@ -283,65 +213,63 @@ def groups_to_zerver_stream(yammer_data: Dict[str, pd.DataFrame], realm_id: int,
     zerver_recipient = []
     zerver_defaultstream = []
 
-    subscription_id_count = recipient_id_count = defaultstream_id = 0
+    subscription_id_count = recipient_id_count = 0
+    defaultstream_id = 1
 
     logging.info('Creating stream from implicit group "All Company"\n')
     all_company_desc = "This is the default stream for all Yammer messages."
-    stream = build_stream(dateutil.parser.parse(yammer_data['Networks'].loc[realm_id, 'created_at']).timestamp(),
+    realm_created_at = float(yammer_data['Networks'][yammer_data['Networks'].zulip_id == realm_id].created_at)
+    stream = build_stream(realm_created_at,
                           realm_id, "Yammer/All Company",
                           all_company_desc, defaultstream_id, False, False)
     zerver_stream.append(stream)
     defaultstream = build_defaultstream(realm_id, defaultstream_id, defaultstream_id)
     zerver_defaultstream.append(defaultstream)
 
+    recipient_id = recipient_id_count
+    recipient = build_recipient(defaultstream_id, recipient_id, Recipient.STREAM)
+    zerver_recipient.append(recipient)
+    added_recipient[stream['name']] = recipient_id
+
+    recipient_id_count += 1
+
     for group in yammer_data['Groups'].itertuples():
-        if group.id == 0: # Highly unlikely, but there is no proof
-            raise
+        stream_id = group.zulip_id
+        recipient_id = recipient_id_count
+
+        description = group.description if pd.notna(group.description) else ""
 
         # construct the stream object and append it to zerver_stream
         logging.info('Creating stream from group "%s"\n' % group.name)
-        stream = build_stream(dateutil.parser.parse(group.created_at).timestamp(), realm_id,
+        stream = build_stream(group.created_at, realm_id,
                               ("Yammer/" + group.name),
-                              group.description, group.id, False, group.private)
+                              description, stream_id, False, group.private)
         zerver_stream.append(stream)
-
-        added_groups[stream['name']] = (channel['id'], stream_id)
 
         recipient = build_recipient(stream_id, recipient_id, Recipient.STREAM)
         zerver_recipient.append(recipient)
         added_recipient[stream['name']] = recipient_id
         # TODO add recipients for private message and huddles
 
-        # construct the subscription object and append it to zerver_subscription
-        subscription_id_count = get_subscription(channel['members'], zerver_subscription,
-                                                 recipient_id, added_users,
-                                                 subscription_id_count)
-        # TODO add zerver_subscription which correspond to
-        # huddles type recipient
-        # For huddles:
-        # sub['recipient']=recipient['id'] where recipient['type_id']=added_users[member]
+# Group subscriptions in Yammer can only be obtained via REST API
+#        # construct the subscription object and append it to zerver_subscription
+#        subscription_id_count = get_subscription(channel['members'], zerver_subscription,
+#                                                 recipient_id, added_users,
+#                                                 subscription_id_count)
 
         recipient_id_count += 1
-        logging.info(u"{} -> created".format(channel['name']))
+        logging.info(u"{} -> created".format(stream['name']))
 
-        # TODO map Slack's pins to Zulip's stars
-        # There is the security model that Slack's pins are known to the team owner
-        # as evident from where it is stored at (channels)
-        # "pins": [
-        #         {
-        #             "id": "1444755381.000003",
-        #             "type": "C",
-        #             "user": "U061A5N1G",
-        #             "owner": "U061A5N1G",
-        #             "created": "1444755463"
-        #         }
-        #         ],
+    for user in yammer_data['Users'].itertuples():
+        # subscribe all users to Yammer/All Company
+        sub = build_subscription(added_recipient["Yammer/All Company"], user.zulip_id, subscription_id_count)
+        zerver_subscription.append(sub)
+        subscription_id_count += 1
 
-    for user in zerver_userprofile:
         # this maps the recipients and subscriptions
         # related to private messages
-        recipient = build_recipient(user['id'], recipient_id_count, Recipient.PERSONAL)
-        sub = build_subscription(recipient_id_count, user['id'], subscription_id_count)
+        recipient = build_recipient(user.zulip_id, recipient_id_count, Recipient.PERSONAL)
+        sub = build_subscription(recipient_id_count, user.zulip_id, subscription_id_count)
 
         zerver_recipient.append(recipient)
         zerver_subscription.append(sub)
@@ -350,21 +278,10 @@ def groups_to_zerver_stream(yammer_data: Dict[str, pd.DataFrame], realm_id: int,
         recipient_id_count += 1
 
     logging.info('######### IMPORTING STREAMS FINISHED #########\n')
-    return zerver_defaultstream, zerver_stream, added_groups, zerver_subscription, \
+    return zerver_defaultstream, zerver_stream, zerver_subscription, \
         zerver_recipient, added_recipient
 
-def get_subscription(channel_members: List[str], zerver_subscription: List[ZerverFieldsT],
-                     recipient_id: int, added_users: AddedUsersT,
-                     subscription_id: int) -> int:
-    for member in channel_members:
-        sub = build_subscription(recipient_id, added_users[member], subscription_id)
-        # The recipient corresponds to a stream for stream-readable message.
-        zerver_subscription.append(sub)
-        subscription_id += 1
-    return subscription_id
-
-def process_long_term_idle_users(slack_data_dir: str, users: List[ZerverFieldsT],
-                                 added_users: AddedUsersT, added_groups: AddedGroupsT,
+def process_long_term_idle_users(yammer_data: Dict[str, pd.DataFrame],
                                  zerver_userprofile: List[ZerverFieldsT]) -> Set[int]:
     """Algorithmically, we treat users who have sent at least 10 messages
     or have sent a message within the last 60 days as active.
@@ -372,69 +289,47 @@ def process_long_term_idle_users(slack_data_dir: str, users: List[ZerverFieldsT]
     have a slighly slower first page load when coming back to
     Zulip.
     """
-    all_messages = get_messages_iterator(slack_data_dir, added_groups)
+    NOW = datetime.datetime.now(timezone.utc)
+    td = relativedelta(days=60)
 
-    sender_counts = defaultdict(int)  # type: Dict[str, int]
-    recent_senders = set()  # type: Set[str]
-    NOW = float(timezone_now().timestamp())
-    for message in all_messages:
-        timestamp = float(message['ts'])
-        slack_user_id = get_message_sending_user(message)
-        if not slack_user_id:
-            # Ignore messages without user names
-            continue
-
-        if slack_user_id in recent_senders:
-            continue
-
-        if NOW - timestamp < 60:
-            recent_senders.add(slack_user_id)
-
-        sender_counts[slack_user_id] += 1
-    for (slack_sender_id, count) in sender_counts.items():
-        if count > 10:
-            recent_senders.add(slack_sender_id)
+    all_messages = yammer_data['Messages']
+    recent_messages = all_messages[all_messages.created_at > (NOW - td).timestamp()]
+    recent_senders = recent_messages.sender_id.drop_duplicates().tolist()
 
     long_term_idle = set()
 
-    for slack_user in users:
-        if slack_user["id"] in recent_senders:
-            continue
-        zulip_user_id = added_users[slack_user['id']]
-        long_term_idle.add(zulip_user_id)
-
     # Record long-term idle status in zerver_userprofile
     for user_profile_row in zerver_userprofile:
-        if user_profile_row['id'] in long_term_idle:
+        if user_profile_row['id'] in recent_senders:
+            continue
+        else:
             user_profile_row['long_term_idle'] = True
             # Setting last_active_message_id to 1 means the user, if
             # imported, will get the full message history for the
             # streams they were on.
             user_profile_row['last_active_message_id'] = 1
+            long_term_idle.add(user_profile_row['id'])
 
     return long_term_idle
 
-def convert_slack_workspace_messages(slack_data_dir: str, users: List[ZerverFieldsT], realm_id: int,
-                                     added_users: AddedUsersT, added_recipient: AddedRecipientsT,
-                                     added_groups: AddedGroupsT, realm: ZerverFieldsT,
-                                     zerver_userprofile: List[ZerverFieldsT],
-                                     zerver_realmemoji: List[ZerverFieldsT], domain_name: str,
-                                     output_dir: str,
-                                     chunk_size: int=MESSAGE_BATCH_CHUNK_SIZE) -> Tuple[List[ZerverFieldsT],
-                                                                                        List[ZerverFieldsT],
-                                                                                        List[ZerverFieldsT]]:
+def convert_yammer_messages(yammer_data: Dict[str, pd.DataFrame], realm_id: int,
+                            added_recipient: AddedRecipientsT, realm: ZerverFieldsT,
+                            zerver_userprofile: List[ZerverFieldsT],
+                            zerver_realmemoji: List[ZerverFieldsT], domain_name: str,
+                            output_dir: str,
+                            chunk_size: int=MESSAGE_BATCH_CHUNK_SIZE) -> Tuple[List[ZerverFieldsT],
+                                                                               List[ZerverFieldsT],
+                                                                               List[ZerverFieldsT]]:
     """
     Returns:
-    1. reactions, which is a list of the reactions
+    1. reactions, which is a list of the reactions (none in case of Yammer)
     2. uploads, which is a list of uploads to be mapped in uploads records.json
     3. attachment, which is a list of the attachments
     """
-
-    long_term_idle = process_long_term_idle_users(slack_data_dir, users, added_users,
-                                                  added_groups, zerver_userprofile)
+    long_term_idle = process_long_term_idle_users(yammer_data, zerver_userprofile)
 
     # Now, we actually import the messages.
-    all_messages = get_messages_iterator(slack_data_dir, added_groups)
+    all_messages = yammer_data['Messages']
     logging.info('######### IMPORTING MESSAGES STARTED #########\n')
 
     total_reactions = []  # type: List[ZerverFieldsT]
@@ -448,265 +343,269 @@ def convert_slack_workspace_messages(slack_data_dir: str, users: List[ZerverFiel
         zerver_subscription=realm['zerver_subscription'],
     )
 
-    while True:
-        message_data = []
-        _counter = 0
-        for msg in all_messages:
-            _counter += 1
-            message_data.append(msg)
-            if _counter == chunk_size:
-                break
-        if len(message_data) == 0:
-            break
+    zerver_messages, zerver_usermessages, attachments, uploads, reactions = \
+                    yammer_message_to_zerver_message(yammer_data, realm_id, realm,
+                                                     added_recipient, all_messages,
+                                                     zerver_realmemoji, subscriber_map,
+                                                     domain_name, long_term_idle)
 
-        zerver_message, zerver_usermessage, attachment, uploads, reactions = \
-            channel_message_to_zerver_message(
-                realm_id, users, added_users, added_recipient, message_data,
-                zerver_realmemoji, subscriber_map, added_groups,
-                domain_name, long_term_idle)
+    while len(zerver_messages) > 0 or len(zerver_usermessages) > 0:
+        if len(zerver_messages) > 0:
+            try:
+                zerver_chunk = zerver_messages[0:MESSAGE_BATCH_CHUNK_SIZE-1]
+                del zerver_messages[0:MESSAGE_BATCH_CHUNK_SIZE-1]
+            except ValueError:
+                zerver_chunk = zerver_messages[0:]
+                del zerver_messages[:]
+        else:
+            zerver_chunk = []
+
+        if len(zerver_usermessages) > 0:
+            try:
+                zerver_userchunk = zerver_usermessages[0:MESSAGE_BATCH_CHUNK_SIZE-1]
+                del zerver_usermessages[0:MESSAGE_BATCH_CHUNK_SIZE-1]
+            except ValueError:
+                zerver_userchunk = zerver_usermessages[0:]
+                del zerver_usermessages[:]
+        else:
+            zerver_userchunk = []
 
         message_json = dict(
-            zerver_message=zerver_message,
-            zerver_usermessage=zerver_usermessage)
+            zerver_message=zerver_chunk,
+            zerver_usermessage=zerver_userchunk)
 
         message_file = "/messages-%06d.json" % (dump_file_id,)
         logging.info("Writing Messages to %s\n" % (output_dir + message_file))
         create_converted_data_files(message_json, output_dir, message_file)
-
-        total_reactions += reactions
-        total_attachments += attachment
-        total_uploads += uploads
-
         dump_file_id += 1
 
     logging.info('######### IMPORTING MESSAGES FINISHED #########\n')
-    return total_reactions, total_uploads, total_attachments
+    return reactions, uploads, attachments
 
-def get_messages_iterator(slack_data_dir: str, added_groups: AddedGroupsT) -> Iterator[ZerverFieldsT]:
-    """This function is an iterator that returns all the messages across
-       all Slack channels, in order by timestamp.  It's important to
-       not read all the messages into memory at once, because for
-       large imports that can OOM kill."""
-    all_json_names = defaultdict(list)  # type: Dict[str, List[str]]
-    for channel_name in added_groups.keys():
-        channel_dir = os.path.join(slack_data_dir, channel_name)
-        json_names = os.listdir(channel_dir)
-        for json_name in json_names:
-            all_json_names[json_name].append(channel_dir)
+def yammer_message_to_zerver_message(yammer_data: Dict[str, pd.DataFrame],
+                                     realm_id: int, realm: ZerverFieldsT,
+                                     added_recipient: AddedRecipientsT,
+                                     all_messages: pd.DataFrame,
+                                     zerver_realmemoji: List[ZerverFieldsT],
+                                     subscriber_map: Dict[int, Set[int]],
+                                     domain_name: str,
+                                     long_term_idle: Set[int]) -> Tuple[List[ZerverFieldsT],
+                                                                        List[ZerverFieldsT],
+                                                                        List[ZerverFieldsT],
+                                                                        List[ZerverFieldsT],
+                                                                        List[ZerverFieldsT]]:
+    """
+    Returns:
+    1. zerver_message, which is a list of the messages
+    2. zerver_usermessage, which is a list of the usermessages
+    3. zerver_attachment, which is a list of the attachments
+    4. uploads_list, which is a list of uploads to be mapped in uploads records.json
+    5. reaction_list, which is a list of all user reactions
+    """
+    zerver_message = []
+    zerver_usermessage = []  # type: List[ZerverFieldsT]
+    uploads_list = []  # type: List[ZerverFieldsT]
+    zerver_attachment = []  # type: List[ZerverFieldsT]
+    reaction_list = []  # type: List[ZerverFieldsT]
 
-    # Sort json_name by date
-    for json_name in sorted(all_json_names.keys()):
-        messages_for_one_day = []  # type: List[ZerverFieldsT]
-        for channel_dir in all_json_names[json_name]:
-            message_dir = os.path.join(channel_dir, json_name)
-            messages = get_data_file(message_dir)
-            channel_name = os.path.basename(channel_dir)
-            for message in messages:
-                # To give every message the channel information
-                message['channel_name'] = channel_name
-            messages_for_one_day += messages
+    added_messages = {} # type Dict[str, ZerverFieldsT]
 
-        # we sort the messages according to the timestamp to show messages with
-        # the proper date order
-        for message in sorted(messages_for_one_day, key=lambda m: m['ts']):
-            yield message
-##
-##def channel_message_to_zerver_message(realm_id: int,
-##                                      users: List[ZerverFieldsT],
-##                                      added_users: AddedUsersT,
-##                                      added_recipient: AddedRecipientsT,
-##                                      all_messages: List[ZerverFieldsT],
-##                                      zerver_realmemoji: List[ZerverFieldsT],
-##                                      subscriber_map: Dict[int, Set[int]],
-##                                      added_groups: AddedGroupsT,
-##                                      domain_name: str,
-##                                      long_term_idle: Set[int]) -> Tuple[List[ZerverFieldsT],
-##                                                                         List[ZerverFieldsT],
-##                                                                         List[ZerverFieldsT],
-##                                                                         List[ZerverFieldsT],
-##                                                                         List[ZerverFieldsT]]:
-##    """
-##    Returns:
-##    1. zerver_message, which is a list of the messages
-##    2. zerver_usermessage, which is a list of the usermessages
-##    3. zerver_attachment, which is a list of the attachments
-##    4. uploads_list, which is a list of uploads to be mapped in uploads records.json
-##    5. reaction_list, which is a list of all user reactions
-##    """
-##    zerver_message = []
-##    zerver_usermessage = []  # type: List[ZerverFieldsT]
-##    uploads_list = []  # type: List[ZerverFieldsT]
-##    zerver_attachment = []  # type: List[ZerverFieldsT]
-##    reaction_list = []  # type: List[ZerverFieldsT]
-##
-##    # For unicode emoji
-##    with open(NAME_TO_CODEPOINT_PATH) as fp:
-##        name_to_codepoint = ujson.load(fp)
-##
-##    total_user_messages = 0
-##    total_skipped_user_messages = 0
-##    for message in all_messages:
-##        user = get_message_sending_user(message)
-##        if not user:
-##            # Ignore messages without user names
-##            # These are Sometimes produced by slack
-##            continue
-##
-##        subtype = message.get('subtype', False)
-##        if subtype in [
-##                # Zulip doesn't have a pinned_item concept
-##                "pinned_item",
-##                "unpinned_item",
-##                # Slack's channel join/leave notices are spammy
-##                "channel_join",
-##                "channel_leave",
-##                "channel_name"
-##        ]:
-##            continue
-##
-##        try:
-##            content, mentioned_user_ids, has_link = convert_to_zulip_markdown(
-##                message['text'], users, added_groups, added_users)
-##        except Exception:
-##            print("Slack message unexpectedly missing text representation:")
-##            print(ujson.dumps(message, indent=4))
-##            continue
-##        rendered_content = None
-##
-##        recipient_id = added_recipient[message['channel_name']]
-##        message_id = NEXT_ID('message')
-##
-##        # Process message reactions
-##        if 'reactions' in message.keys():
-##            build_reactions(reaction_list, message['reactions'], added_users,
-##                            message_id, name_to_codepoint,
-##                            zerver_realmemoji)
-##
-##        # Process different subtypes of slack messages
-##
-##        # Subtypes which have only the action in the message should
-##        # be rendered with '/me' in the content initially
-##        # For example "sh_room_created" has the message 'started a call'
-##        # which should be displayed as '/me started a call'
-##        if subtype in ["bot_add", "sh_room_created", "me_message"]:
-##            content = ('/me %s' % (content))
-##        if subtype == 'file_comment':
-##            # The file_comment message type only indicates the
-##            # responsible user in a subfield.
-##            message['user'] = message['comment']['user']
-##
-##        file_info = process_message_files(
-##            message=message,
-##            domain_name=domain_name,
-##            realm_id=realm_id,
-##            message_id=message_id,
-##            user=user,
-##            users=users,
-##            added_users=added_users,
-##            zerver_attachment=zerver_attachment,
-##            uploads_list=uploads_list,
-##        )
-##
-##        content += file_info['content']
-##        has_link = has_link or file_info['has_link']
-##
-##        has_attachment = file_info['has_attachment']
-##        has_image = file_info['has_image']
-##
-##        # construct message
-##        topic_name = 'imported from slack'
-##
-##        zulip_message = build_message(topic_name, float(message['ts']), message_id, content,
-##                                      rendered_content, added_users[user], recipient_id,
-##                                      has_image, has_link, has_attachment)
-##        zerver_message.append(zulip_message)
-##
-##        # construct usermessages
-##        (num_created, num_skipped) = build_usermessages(
-##            zerver_usermessage=zerver_usermessage,
-##            subscriber_map=subscriber_map,
-##            recipient_id=recipient_id,
-##            mentioned_user_ids=mentioned_user_ids,
-##            message_id=message_id,
-##            long_term_idle=long_term_idle,
-##        )
-##        total_user_messages += num_created
-##        total_skipped_user_messages += num_skipped
-##
-##    logging.debug("Created %s UserMessages; deferred %s due to long-term idle" % (
-##        total_user_messages, total_skipped_user_messages))
-##    return zerver_message, zerver_usermessage, zerver_attachment, uploads_list, \
-##        reaction_list
-#
-#def process_message_files(message: ZerverFieldsT,
-#                          domain_name: str,
-#                          realm_id: int,
-#                          message_id: int,
-#                          user: str,
-#                          users: List[ZerverFieldsT],
-#                          added_users: AddedUsersT,
-#                          zerver_attachment: List[ZerverFieldsT],
-#                          uploads_list: List[ZerverFieldsT]) -> Dict[str, Any]:
-#    has_attachment = False
-#    has_image = False
-#    has_link = False
-#
-#    files = message.get('files', [])
-#
-#    subtype = message.get('subtype')
-#
-#    if subtype == 'file_share':
-#        # In Slack messages, uploads can either have the subtype as 'file_share' or
-#        # have the upload information in 'files' keyword
-#        files = [message['file']]
-#
-#    markdown_links = []
-#
-#    for fileinfo in files:
-#        if fileinfo.get('mode', '') == 'tombstone':
-#            # Slack sometimes includes tombstone mode files with no
-#            # real data on the actual file (presumably in cases where
-#            # the file was deleted).
-#            continue
-#
-#        url = fileinfo['url_private']
-#
-#        if 'files.slack.com' in url:
-#            # For attachments with slack download link
-#            has_attachment = True
-#            has_link = True
-#            has_image = True if 'image' in fileinfo['mimetype'] else False
-#
-#            file_user = [iterate_user for iterate_user in users if message['user'] == iterate_user['id']]
-#            file_user_email = get_user_email(file_user[0], domain_name)
-#
-#            s3_path, content_for_link = get_attachment_path_and_content(fileinfo, realm_id)
-#            markdown_links.append(content_for_link)
-#
-#            # construct attachments
-#            build_uploads(added_users[user], realm_id, file_user_email, fileinfo, s3_path,
-#                          uploads_list)
-#
-#            build_attachment(realm_id, {message_id}, added_users[user],
-#                             fileinfo, s3_path, zerver_attachment)
-#        else:
-#            # For attachments with link not from slack
-#            # Example: Google drive integration
-#            has_link = True
-#            if 'title' in fileinfo:
-#                file_name = fileinfo['title']
-#            else:
-#                file_name = fileinfo['name']
-#            markdown_links.append('[%s](%s)' % (file_name, fileinfo['url_private']))
-#
-#    content = '\n'.join(markdown_links)
-#
-#    return dict(
-#        content=content,
-#        has_attachment=has_attachment,
-#        has_image=has_image,
-#        has_link=has_link,
-#    )
+    total_user_messages = 0
+    total_skipped_user_messages = 0
+    for message in all_messages.itertuples():
+        users = yammer_data['Users']
+
+        if message.sender_id in users.index:
+            user_id = int(users.zulip_id[message.sender_id])
+        else:
+            user_id = int(message.sender_id)
+
+        if pd.notna(message.group_id):
+            stream_name = "Yammer/" + str(yammer_data['Groups'].name[message.group_id])
+            stream_id = int(yammer_data['Groups'].zulip_id[message.group_id])
+        else:
+            # FIXME: Should this really be hardcoded?
+            stream_name = "Yammer/All Company"
+            stream_id = 1
+
+        recipient_id = added_recipient[stream_name]
+        message_id = message.zulip_id
+
+        try:
+            content, mentioned_user_ids, has_link = convert_to_zulip_markdown(
+                realm, users, message, added_messages)
+        except Exception:
+            print("Yammer message unexpectedly missing text representation:")
+            print(message)
+            raise
+
+        rendered_content = None
+
+        file_info = process_message_files(
+            yammer_data=yammer_data,
+            message=message,
+            domain_name=domain_name,
+            realm_id=realm_id,
+            message_id=message_id,
+            zerver_attachment=zerver_attachment,
+            uploads_list=uploads_list,
+        )
+
+        content += file_info['content']
+        has_link = has_link or file_info['has_link']
+
+        has_attachment = file_info['has_attachment']
+        has_image = file_info['has_image']
+
+        # construct message
+        topic_name = 'Yammer: ' + str(message.thread_id)
+
+        zulip_message = build_message(topic_name, message.created_at, message_id,
+                                      content, rendered_content, user_id, recipient_id,
+                                      has_image, has_link, has_attachment)
+
+        if pd.notna(message.replied_to_id):
+            # Zulip doesn't provide real threading, so we add a link
+            # to the replied-to message where necessary. The code is
+            # similar to ``near_stream_message_url()`` but creates
+            # relative links.
+            if message.replied_to_id in added_messages:
+#                replied_to_header = "(go to message being replied to)\n\n"
+                replied_to_msg = added_messages[message.replied_to_id]
+                encoded_topic = hash_util_encode(topic_name)
+                encoded_stream = encode_stream(stream_id=stream_id, stream_name=stream_name)
+
+                replied_to_link = '/'.join(['#narrow',
+                                            'stream',
+                                            encoded_stream,
+                                            'topic',
+                                            encoded_topic,
+                                            'near',
+                                            str(replied_to_msg['id']),
+                                            ])
+                replied_to_header = "[(go to message being replied to)](" \
+                                    + replied_to_link + ")\n\n"
+            else:
+                replied_to_header = "(unable to locate message being replied to)\n\n"
+
+            zulip_message['content'] = replied_to_header + zulip_message['content']
+
+        zerver_message.append(zulip_message)
+        added_messages[message.id] = zulip_message
+
+        # construct usermessages
+        (num_created, num_skipped) = build_usermessages(
+            zerver_usermessage=zerver_usermessage,
+            subscriber_map=subscriber_map,
+            recipient_id=recipient_id,
+            mentioned_user_ids=mentioned_user_ids,
+            message_id=message_id,
+            long_term_idle=long_term_idle,
+        )
+        total_user_messages += num_created
+        total_skipped_user_messages += num_skipped
+
+    logging.debug("Created %s UserMessages; deferred %s due to long-term idle" % (
+        total_user_messages, total_skipped_user_messages))
+    return zerver_message, zerver_usermessage, zerver_attachment, uploads_list, \
+        reaction_list
+
+def process_message_files(yammer_data: Dict[str, pd.DataFrame],
+                          message: namedtuple,
+                          domain_name: str,
+                          realm_id: int,
+                          message_id: int,
+                          zerver_attachment: List[ZerverFieldsT],
+                          uploads_list: List[ZerverFieldsT]) -> Dict[str, Any]:
+    has_attachment = False
+    has_image = False
+    has_link = False
+
+    mimetypes.init()
+
+    files = yammer_data['Files']
+
+
+    markdown_links = []
+
+    ATTACHMENT_REGEX = r"(" + "|".join([r"(uploadedfile):(?P<file_id>\d+)",
+                                        r"(opengraphobject):(\d+)",
+                                        r"(opengraphobject):\[(\d+)\s*:\s*(?P<ogobj_uri>.*?)\]",
+                                        ]) + r")"
+
+    if pd.notna(message.attachments):
+        for m in re.finditer(ATTACHMENT_REGEX, message.attachments):
+            if m.group('file_id'):
+                # file
+                file_id = m.group('file_id')
+                file_data = files[files.file_id == np.int64(file_id)].iloc[0]
+
+
+                if pd.isna(file_data["deleted_at"]):
+                    try:
+                        zip_info = file_data["zip_file"].getinfo(file_data["path"])
+                    except KeyError:
+                        zip_info = None
+
+                    if zip_info:
+                        fileinfo = dict(
+                            name=file_data["name"],
+                            title=(file_data["description"] if pd.notna(file_data["description"]) \
+                                   else file_data["name"]),
+                            size=zip_info.file_size,
+                            created=float(file_data["uploaded_at"]),
+                            )
+
+                        has_attachment = True
+                        has_link = True
+
+                        if mimetypes.guess_type(fileinfo["name"])[0] == 'image':
+                            has_image = True
+
+                        s3_path, content = get_attachment_path_and_content(fileinfo, realm_id)
+                        markdown_links.append(content)
+
+                        try:
+                            user_profile_id = int(yammer_data['Users'].loc[message.sender_id].zulip_id)
+                        except KeyError:
+                            user_profile_id = int(message.sender_id)
+                            raise
+
+                        upload = dict(zip_file=file_data["zip_file"], # ZIP file object from which to extract
+                                      path=file_data["path"], # ZIP member to extract
+                                      realm_id=realm_id,
+                                      content_type=None,
+                                      user_profile_id=user_profile_id,
+                                      last_modified=fileinfo["created"],
+                                      user_profile_email=message.sender_email,
+                                      s3_path=s3_path, # File name to extract to
+                                      size=fileinfo["size"]
+                                      )
+                        uploads_list.append(upload)
+
+                        build_attachment(realm_id, {message.zulip_id}, user_profile_id,
+                                         fileinfo, s3_path, zerver_attachment)
+                    else:
+                        markdown_links.append("*File %s couldn't be imported*" % file_data.name)
+                else:
+                    markdown_links.append("*File %s was deleted*" % file_data.name)
+
+            elif m.group('ogobj_uri'):
+                # link
+                has_link = True
+                markdown_links.append(m.group('ogobj_uri'))
+
+    content = "\n" + "\n".join(markdown_links) if markdown_links else ""
+    if message.body == "" and content == "":
+        content = str("*(This message was originally empty. It may have contained "
+                      "a link attachment which couldn't be reconstructed.)*\n")
+
+    return dict(
+        content=content,
+        has_attachment=has_attachment,
+        has_image=has_image,
+        has_link=has_link,
+    )
 
 def get_attachment_path_and_content(fileinfo: ZerverFieldsT, realm_id: int) -> Tuple[str,
                                                                                      str]:
@@ -714,74 +613,16 @@ def get_attachment_path_and_content(fileinfo: ZerverFieldsT, realm_id: int) -> T
     # 'upload_message_file'
     s3_path = "/".join([
         str(realm_id),
-        'SlackImportAttachment',  # This is a special placeholder which should be kept
-                                  # in sync with 'exports.py' function 'import_message_data'
+        'YammerImportAttachment',  # This is a special placeholder which should be kept
+                                   # in sync with 'exports.py' function 'import_message_data'
         format(random.randint(0, 255), 'x'),
         random_name(18),
         sanitize_name(fileinfo['name'])
     ])
     attachment_path = ('/user_uploads/%s' % (s3_path))
-    content = '[%s](%s)' % (fileinfo['title'], attachment_path)
+    content = '\n[%s](%s)' % (fileinfo['title'], attachment_path)
 
     return s3_path, content
-
-def build_reactions(reaction_list: List[ZerverFieldsT], reactions: List[ZerverFieldsT],
-                    added_users: AddedUsersT, message_id: int,
-                    name_to_codepoint: ZerverFieldsT,
-                    zerver_realmemoji: List[ZerverFieldsT]) -> None:
-    realmemoji = {}
-    for realm_emoji in zerver_realmemoji:
-        realmemoji[realm_emoji['name']] = realm_emoji['id']
-
-    # For the unicode emoji codes, we use equivalent of
-    # function 'emoji_name_to_emoji_code' in 'zerver/lib/emoji' here
-    for slack_reaction in reactions:
-        emoji_name = slack_reaction['name']
-        # Check in unicode emoji
-        if emoji_name in name_to_codepoint:
-            emoji_code = name_to_codepoint[emoji_name]
-            reaction_type = Reaction.UNICODE_EMOJI
-        # Check in realm emoji
-        elif emoji_name in realmemoji:
-            emoji_code = realmemoji[emoji_name]
-            reaction_type = Reaction.REALM_EMOJI
-        else:
-            continue
-
-        for user in slack_reaction['users']:
-            reaction_id = NEXT_ID('reaction')
-            reaction = Reaction(
-                id=reaction_id,
-                emoji_code=emoji_code,
-                emoji_name=emoji_name,
-                reaction_type=reaction_type)
-
-            reaction_dict = model_to_dict(reaction,
-                                          exclude=['message', 'user_profile'])
-            reaction_dict['message'] = message_id
-            reaction_dict['user_profile'] = added_users[user]
-
-            reaction_list.append(reaction_dict)
-
-def build_uploads(user_id: int, realm_id: int, email: str, fileinfo: ZerverFieldsT, s3_path: str,
-                  uploads_list: List[ZerverFieldsT]) -> None:
-    upload = dict(
-        path=fileinfo['url_private'],  # Save slack's url here, which is used later while processing
-        realm_id=realm_id,
-        content_type=None,
-        user_profile_id=user_id,
-        last_modified=fileinfo['timestamp'],
-        user_profile_email=email,
-        s3_path=s3_path,
-        size=fileinfo['size'])
-    uploads_list.append(upload)
-
-def get_message_sending_user(message: ZerverFieldsT) -> Optional[str]:
-    if 'user' in message:
-        return message['user']
-    if message.get('file'):
-        return message['file'].get('user')
-    return None
 
 def read_dumps(ymdumps, tables):
     """
@@ -797,7 +638,19 @@ def read_dumps(ymdumps, tables):
 
         Returns `numpy.nan` if `t` is empty.
         """
-        return dateutil.parser.parse(t) if t else np.nan
+        return dateutil.parser.parse(t).timestamp() if t else np.nan
+
+    def msg_body_to_str(n):
+        """
+        Convert message body to string
+
+        If message body is already a string, pass-through, else return
+        empty string.
+        """
+        if isinstance(n, str):
+            return n
+        else:
+            return ""
 
     for yd in ymdumps:
         logging.info("Reading %s\n" % yd)
@@ -814,7 +667,8 @@ def read_dumps(ymdumps, tables):
                                  'updated_at': parse_time_str }
                 elif zp.stem == 'Messages':
                     converters={ 'created_at': parse_time_str,
-                                 'deleted_at': parse_time_str }
+                                 'deleted_at': parse_time_str,
+                                 'body': msg_body_to_str}
                 elif zp.stem == 'Networks':
                     converters={ 'created_at': parse_time_str }
                 elif zp.stem == 'Topics':
@@ -823,8 +677,9 @@ def read_dumps(ymdumps, tables):
                     converters={ 'joined_at': parse_time_str,
                                  'deleted_at': parse_time_str }
                 tbl = pd.read_csv(zf.open(str(zp)), converters=converters)
-#                if zp.stem == 'Files':
-#                    unpack_attachments(zf, tbl)
+                if zp.stem == 'Files':
+                   # Add column for accessing file attachments later
+                   tbl = tbl.assign(zip_file=zf)
                 if not zp.stem in tables:
                     tables[zp.stem] = []
                 tables[zp.stem].append(tbl)
@@ -841,88 +696,23 @@ def concat_tables(tables):
 
 def reassign_index(tables):
     """
-    After deduplicating the tables the column *id* can be safely used
-    as index again.
+    Create new ID mapping between Yammer and Zulip
+
+    This adds a column *zulip_id*.
     """
+    #  Messages in particular need time-sorted ID.
+    tables['Messages'] = tables['Messages'].sort_values(by='created_at')
+
     for k,v in tables.items():
-        v.set_index('id', False, False, True, False)
-
-
-YM_TAG_REGEX = r"(" + "|".join([r"\[\[user:(?P<user>\d+)\]\]",
-                                r"\[Tag:(?P<topicid>\d+):(?P<topic>[a-zA-Z]\w*)\]",
-                                r"&\[Tag::n/a\](?P<entity>[0-9]+);",
-                                r"\[Tag::(?P<undef>n/a)\]"]) + ")"
-"""
-Regular expression for matching Yammer tags in messages.
-
-These regexps use uniquely named groups for identifying the match and
-selecting appropriate handler code.
-"""
-
-YM_NONTAG_REGEX = r"#(" + "|".join([r"define", r"if", r"else", r"endif", r"ifdef", r"ifndef",
-                                    r"undefine", r"include", r"pragma", r"1step", r"[0-9]+\b"]) + ")"
-"""
-Regular expression for matching text that could be confused with a
-topic hash-tag (non-tags).
-
-Typically these are part of source code snippets, which sadly can't be
-quoted in Yammer.
-"""
-
-YM_ATTACHMENT_REGEX = r"(" + "|".join([r"uploadedfile:(?P<fileid>\d+)",
-                                       r"opengraphobject:(?P<ogobjid>\d+)",
-                                       r"opengraphobject:[(?P<ogobjid>\d+)\s*:\s*(?P<ogobjuri>.*?)]",
-                                       ]) + r")"
-
-def message_process(msg, tables):
-    """
-    Process messages for target system.
-    """
-    msg = message_quote_special(msg)
-    msg = message_detaglify(msg, tables)
-    # ...
-    return msg
-
-def message_quote_special(msg):
-    """
-    Technical conversations in Verilab make frequent use of
-    programming constructs that begin with a ``#`` character and
-    thus look like hash tags.
-    We will identify these and quote them appropriately.
-    """
-    pass
-
-def message_detaglify(msg, tables):
-    """
-    Convert Yammer tags to Zulip markdown (and fix some quirks on the way)
-    """
-    if pd.notna(msg):
-        fragments = [] # list of output strings to be joined at the end
-        pos = 0
-        for m in re.finditer(YM_TAG_REGEX, msg):
-            if m.start(0) > pos:
-                fragments.append(msg[pos:m.start(0)])
-            pos = m.end(0)
-            if m.group('user'):
-                uid = np.int64(m.group('user'))
-                try:
-                    username = tables['Users'][uid, 'name']
-                except:
-                    username = "Unknown User"
-                fragments.append("@**")
-                fragments.append(username)
-                fragments.append("**")
-            elif m.group('topic'):
-                fragments.append("#")
-                fragments.append(m.group('topic'))
-            elif m.group('entity'):
-                fragments.append(chr(int(m.group('entity'))))
-            elif m.group('undef'):
-                fragments.append('#')
-        fragments.append(msg[pos:])
-        return ''.join(fragments)
-    else:
-        return ""
+        tables[k].set_index('id', False, False, True, False)
+        # Add sequence numbers starting from 1, except in case of
+        # groups (Zulip streams) which have to start at 2 due to
+        # implicit "All Company".
+        if k == 'Groups':
+            start_id = 2
+        else:
+            start_id = 1
+        tables[k] = v.assign(zulip_id=range(start_id, v.count(axis=0).id + start_id))
 
 def do_convert_data(yammer_zip_files: List[str], output_dir: str, threads: int=6) -> None:
     # Subdomain is set by the user while running the import command
@@ -937,32 +727,27 @@ def do_convert_data(yammer_zip_files: List[str], output_dir: str, threads: int=6
     concat_tables(tables)
     reassign_index(tables)
 
-    realm_id = int(tables['Networks']['id'].iloc[0])
-    domain_name = tables['Networks'].loc[realm_id, 'permalink']
+    realm_id = int(tables['Networks'].iloc[0].zulip_id)
+    domain_name = tables['Networks'].iloc[0].permalink
 
     # Limit to users who actually participated in conversations,
     # i.e. ignore test accounts, etc.
     tables['Users'] = tables['Users'][tables['Users'].index.isin(tables['Messages']['sender_id'])]
 
-#    # Fix Yammer messages
-#    msg_bodies = tables['Messages']['body']
-#    msg_bodies.apply(message_process, args=(tables,))
-
-    realm, added_users, added_recipient, added_groups, avatar_list, \
+    realm, added_users, added_recipient, avatar_list, \
         emoji_url_map = yammer_network_to_realm(domain_name, realm_id,
                                                 realm_subdomain, tables)
 
-    zerver_attachment = []
-#    reactions, uploads_list, zerver_attachment = convert_yammer_workspace_messages(
-#        yammer_data_dir, user_list, realm_id, added_users, added_recipient, added_groups,
-#        realm, realm['zerver_userprofile'], realm['zerver_realmemoji'], domain_name, output_dir)
-#
-#    uploads_folder = os.path.join(output_dir, 'uploads')
-#    os.makedirs(os.path.join(uploads_folder, str(realm_id)), exist_ok=True)
-#    uploads_records = process_uploads(uploads_list, uploads_folder, threads)
+    reactions, uploads_list, zerver_attachment = convert_yammer_messages(
+        tables, realm_id, added_recipient, realm, realm['zerver_userprofile'],
+        realm['zerver_realmemoji'], domain_name, output_dir)
+
     emoji_records = {}
     avatar_records = {}
-    uploads_records = {}
+
+    uploads_folder = os.path.join(output_dir, 'uploads')
+    os.makedirs(os.path.join(uploads_folder, str(realm_id)), exist_ok=True)
+    uploads_records = yammer_process_uploads(uploads_list, uploads_folder)
     attachment = {"zerver_attachment": zerver_attachment}
 
     # IO realm.json
@@ -983,7 +768,28 @@ def do_convert_data(yammer_zip_files: List[str], output_dir: str, threads: int=6
     logging.info('######### DATA CONVERSION FINISHED #########\n')
     logging.info("Zulip data dump created at %s" % (output_dir))
 
-def get_data_file(path: str) -> Any:
-    with open(path, "r") as fp:
-        data = ujson.load(fp)
-        return data
+def yammer_process_uploads(upload_list: List[ZerverFieldsT], upload_dir: str) -> List[ZerverFieldsT]:
+    """
+    This function unpacks the uploads and saves it in the realm's upload directory.
+    Required parameters:
+
+    1. upload_list: List of uploads to be mapped in uploads records.json file
+    2. upload_dir: Folder where the downloaded uploads are saved
+    """
+    logging.info('######### GETTING ATTACHMENTS #########\n')
+    logging.info('UNPACKING ATTACHMENTS .......\n')
+
+    for upload in upload_list:
+        upload_s3_path = PurePath(upload_dir).joinpath(PurePath(upload['s3_path']))
+        upload_s3_dir = str(upload_s3_path.parent)
+        upload_s3_path = str(upload_s3_path)
+        logging.info('%s -> %s\n' % (upload['path'], upload_s3_path))
+        os.makedirs(upload_s3_dir)
+        fo = open(upload_s3_path, 'wb')
+        fo.write(upload['zip_file'].read(upload['path']))
+        fo.close()
+        del upload['zip_file']
+        upload['path'] = upload_s3_path
+
+    logging.info('######### GETTING ATTACHMENTS FINISHED #########\n')
+    return upload_list
