@@ -637,4 +637,5 @@ def create_converted_data_files(data: Any, output_dir: str, file_path: str) -> N
     output_file = output_dir + file_path
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
     with open(output_file, 'w') as fp:
+        logging.info('Writing %s\n' % output_file)
         ujson.dump(data, fp, indent=4)

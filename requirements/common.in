@@ -170,6 +170,9 @@ virtualenv-clone==0.5.1
 # Needed for reading json as stream
 ijson==2.3
 
+# Needed for Yammer import
+pandas==0.22.0
+
 # Needed for link preview
 beautifulsoup4==4.7.1
 pyoembed==0.1.2
